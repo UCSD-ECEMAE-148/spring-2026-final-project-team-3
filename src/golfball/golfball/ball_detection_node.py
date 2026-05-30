@@ -2,239 +2,308 @@
 
 import rclpy
 from rclpy.node import Node
-from rclpy.executors import MultiThreadedExecutor
 import cv2
 import depthai as dai
 import numpy as np
 from custom_interfaces.msg import DetectedBall, DetectedBalls
 from std_msgs.msg import Header
 import os
+import threading
+import time
+from flask import Flask, Response
 
-# Config constants (from detection2.py)
+# ====== CONFIGURATION ======
 BLOB_PATH = "/home/projects/ros2_ws/src/golfball/detection_model/best.blob"
 CONFIDENCE_THRESHOLD = 0.3
-ALPHA = 1.0  # Lower = smoother, Higher = snappier
 MAX_BALLS = 3
-DIST_THRESH = 80 # Max pixel distance to match a ball to its previous position
+ALPHA = 1.5
+DIST_THRESH = 80
+SHOW_DISPLAY = False   # TOGGLE: True = Process video overlay for Web, False = Fast coordinates only
+# ===========================
+
+app = Flask(__name__)
+latest_web_jpeg = b''
+frame_lock = threading.Lock()
+
 
 def create_pipeline():
-    """Create OAK pipeline (from detection2.py)."""
     pipeline = dai.Pipeline()
-    cam_rgb = pipeline.create(dai.node.ColorCamera)
-    detection_nn = pipeline.create(dai.node.NeuralNetwork)
-    # manip = pipeline.create(dai.node.ImageManip)
-    # xout_rgb = pipeline.create(dai.node.XLinkOut)
-    # xout_nn = pipeline.create(dai.node.XLinkOut)
-    # xout_rgb.setStreamName("rgb")
-    # xout_nn.setStreamName("nn")
+    cam = pipeline.create(dai.node.ColorCamera)
+    nn = pipeline.create(dai.node.NeuralNetwork)
     
-    cam_rgb.setPreviewSize(640, 640)
-    cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-    cam_rgb.setInterleaved(False)
-    cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
-    cam_rgb.setPreviewKeepAspectRatio(True)
+    manip_bgr = pipeline.create(dai.node.ImageManip)
+    manip_nv12 = pipeline.create(dai.node.ImageManip)
+    video_enc = pipeline.create(dai.node.VideoEncoder)
+
+    xout_mjpeg = pipeline.create(dai.node.XLinkOut)
+    xout_nn = pipeline.create(dai.node.XLinkOut)
     
-    manip.setMaxOutputFrameSize(640 * 640 * 3)
-    # manip.initialConfig.setCropRect(0.0, 0.25, 1.0, 1.0)
-    # manip.initialConfig.setResize(640, 640)
-    # manip.initialConfig.setCropRect(0.0, 0.25, 1.0, 1.0) // this crops the top 25% of the frame, which may help if the camera is angled downwards and we want to ignore the ceiling
-    manip.setResize(640, 640)  # top-level call instead
+    xout_mjpeg.setStreamName("mjpeg")
+    xout_nn.setStreamName("nn")
+
+    # ===== CAMERA CONFIG =====
+    cam.setPreviewSize(640, 640)
+    cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+    cam.setInterleaved(False)
+    cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+    cam.setFps(30)
+    cam.setPreviewKeepAspectRatio(True)
+
+    # ===== MANIP BGR CONFIG (For Neural Network) =====
+    manip_bgr.setMaxOutputFrameSize(640 * 640 * 3)
+    manip_bgr.setResize(640, 640)
+    manip_bgr.setFrameType(dai.RawImgFrame.Type.BGR888p)
+
+    # ===== MANIP NV12 CONFIG (For Video Encoder) =====
+    manip_nv12.setMaxOutputFrameSize(640 * 640 * 3)
+    manip_nv12.setResize(640, 640)
+    manip_nv12.setFrameType(dai.RawImgFrame.Type.NV12)
+
+    # ===== VIDEO ENCODER CONFIG =====
+    video_enc.setDefaultProfilePreset(30, dai.VideoEncoderProperties.Profile.MJPEG)
+    video_enc.setQuality(80)
     
-    detection_nn.setBlobPath(BLOB_PATH)
-    detection_nn.setConfidenceThreshold(CONFIDENCE_THRESHOLD)
-    detection_nn.setNumClasses(1)
-    detection_nn.setCoordinateSize(4)
-    detection_nn.setIouThreshold(0.5)
+    nn.setBlobPath(BLOB_PATH)
+
+    # ===== PIPELINE LINKS =====
+    cam.preview.link(manip_bgr.inputImage)
+    cam.preview.link(manip_nv12.inputImage)
     
-    cam_rgb.preview.link(manip.inputImage)
-    manip.out.link(detection_nn.input)
-    manip.out.link(xout_rgb.input)
-    detection_nn.out.link(xout_nn.input)
-    
+    manip_bgr.out.link(nn.input)
+    manip_nv12.out.link(video_enc.input)
+
+    video_enc.bitstream.link(xout_mjpeg.input)
+    nn.out.link(xout_nn.input)
     return pipeline
 
-def update_tracked_balls(raw_detections, tracked_balls, next_ball_id, width, height):
-    """Update tracked balls with new detections (from detection2.py)."""
-    current_frame_matches = {}
-    
-    for detection in raw_detections:
-        rx1 = int(detection.xmin * width)
-        ry1 = int(detection.ymin * height)
-        rx2 = int(detection.xmax * width)
-        ry2 = int(detection.ymax * height)
-        conf = detection.confidence
-        rcx, rcy = (rx1 + rx2) // 2, (ry1 + ry2) // 2
-        
-        matched_id = None
-        best_dist = DIST_THRESH
-        
-        for b_id, data in tracked_balls.items():
-            prev_cx = (data[0] + data[2]) // 2
-            prev_cy = (data[1] + data[3]) // 2
-            distance = np.hypot(rcx - prev_cx, rcy - prev_cy)
-            if distance < best_dist:
-                best_dist = distance
-                matched_id = b_id
-        
-        if matched_id is None:
-            matched_id = next_ball_id
-            next_ball_id += 1
-            current_frame_matches[matched_id] = [rx1, ry1, rx2, ry2, 0, conf]
-        else:
-            prev = tracked_balls[matched_id]
-            sm_x1 = int(ALPHA * rx1 + (1 - ALPHA) * prev[0])
-            sm_y1 = int(ALPHA * ry1 + (1 - ALPHA) * prev[1])
-            sm_x2 = int(ALPHA * rx2 + (1 - ALPHA) * prev[2])
-            sm_y2 = int(ALPHA * ry2 + (1 - ALPHA) * prev[3])
-            sm_conf = ALPHA * conf + (1 - ALPHA) * prev[5]
-            current_frame_matches[matched_id] = [sm_x1, sm_y1, sm_x2, sm_y2, 0, sm_conf]
-    
-    for b_id in list(tracked_balls.keys()):
-        if b_id not in current_frame_matches:
-            tracked_balls[b_id][4] += 1
-            if tracked_balls[b_id][4] > 5:
-                del tracked_balls[b_id]
-        else:
-            tracked_balls[b_id] = current_frame_matches[b_id]
-    
-    for b_id, data in current_frame_matches.items():
-        tracked_balls[b_id] = data
-    
-    return tracked_balls, next_ball_id
 
-def display_detections(frame, tracked_balls):
-    """Draw bounding boxes (from detection2.py)."""
-    for b_id, data in tracked_balls.items():
-        x1, y1, x2, y2, _, conf = data
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        label = f"Ball {b_id}: {conf * 100:.1f}%"
-        cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+def make_kalman():
+    kf = cv2.KalmanFilter(6, 4)
+    kf.transitionMatrix = np.array([[1,0,1,0,0,0],[0,1,0,1,0,0],[0,0,1,0,0,0],[0,0,0,1,0,0],[0,0,0,0,1,0],[0,0,0,0,0,1]], dtype=np.float32)
+    kf.measurementMatrix = np.array([[1,0,0,0,0,0],[0,1,0,0,0,0],[0,0,0,0,1,0],[0,0,0,0,0,1]], dtype=np.float32)
+    kf.processNoiseCov = np.eye(6, dtype=np.float32) * 0.5
+    kf.measurementNoiseCov = np.eye(4, dtype=np.float32) * 0.1
+    kf.errorCovPost = np.eye(6, dtype=np.float32)
+    return kf
+
+
+class Track:
+    def __init__(self, tid, x1, y1, x2, y2, conf):
+        self.id, self.conf, self.age = tid, conf, 0
+        self.kf = make_kalman()
+        
+        # Save the actual width and height measured by YOLO on frame 1
+        self.w = int(x2 - x1)
+        self.h = int(y2 - y1)
+        
+        # If the box is accidentally tiny, enforce a minimum 30x30 pixel size
+        if self.w < 10: self.w = 30
+        if self.h < 10: self.h = 30
+        
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        self.kf.statePost = np.array([[cx], [cy], [0], [0], [float(self.w)], [float(self.h)]], dtype=np.float32)
+
+    def predict(self): 
+        self.kf.predict()
+
+    def update(self, x1, y1, x2, y2, conf):
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        
+        # Keep updating the box dimensions with the latest real sensor readings
+        self.w = int(x2 - x1)
+        self.h = int(y2 - y1)
+        
+        self.kf.correct(np.array([[cx], [cy], [float(self.w)], [float(self.h)]], dtype=np.float32))
+        self.kf.statePost[0,0], self.kf.statePost[1,0] = cx, cy
+        self.conf, self.age = conf, 0
+
+    def get_box(self):
+        s = self.kf.statePost
+        cx, cy = s[0,0], s[1,0]
+        
+        # Natively draw the box around the tracked center using our stable width/height variables
+        return int(cx - self.w / 2), int(cy - self.h / 2), int(cx + self.w / 2), int(cy + self.h / 2)
+
 
 class BallDetectionNode(Node):
     def __init__(self):
         super().__init__('ball_detection_node')
         
-        # Declare parameters
-        self.declare_parameter('display_mode', False)
-        self.declare_parameter('fps', 30)
+        self.pub = self.create_publisher(DetectedBalls, 'detected_balls', 10)
+        self.tracks, self.next_id = {}, 0
+        
+        self.device = dai.Device(create_pipeline())
+        self.q_mjpeg = self.device.getOutputQueue("mjpeg", 1, False)
+        self.q_nn = self.device.getOutputQueue("nn", 1, False)
+        
+        self.running = True
+        self.thread = threading.Thread(target=self.device_loop, daemon=True)
+        self.thread.start()
+        self.get_logger().info(f'Ball Detection Node initialized. Show Display = {SHOW_DISPLAY}')
 
-        self.declare_parameter('save_frames', True)  # Optional: Save frames for debugging
-        self.declare_parameter('save_interval', 30)  # save every 30 frames = ~1/sec at 30fps
-        self.declare_parameter('save_path', './saved_frames')
+    def parse_detections(self, nn_data, width, height):
+        raw_data = nn_data.getLayerFp16('output0') if hasattr(nn_data, 'getLayerFp16') else nn_data.getFirstTensor()
+        if raw_data is None: return []
+        raw = np.array(raw_data).reshape(5, 8400)
         
-        self.display_mode = self.get_parameter('display_mode').value
-        self.fps = self.get_parameter('fps').value
+        dets = []
+        for i in range(8400):
+            c = float(raw[4, i])
+            if c < CONFIDENCE_THRESHOLD: continue
+            cx, cy, w, h = raw[0,i]/640, raw[1,i]/640, raw[2,i]/640, raw[3,i]/640
+            dets.append((cx-w/2, cy-h/2, cx+w/2, cy+h/2, c))
 
-        self.save_frames = self.get_parameter('save_frames').value
-        self.save_interval = self.get_parameter('save_interval').value
-        self.save_path = self.get_parameter('save_path').value
-        self.frame_count = 0
-        
-        self.get_logger().info(f"Ball Detection Node starting (display: {self.display_mode}, fps: {self.fps})")
-        
-        # Initialize OAK device
-        self.pipeline = create_pipeline()
-        self.device = dai.Device(self.pipeline)
-        
-        # Setup queues
-        self.q_rgb = self.device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
-        self.q_nn = self.device.getOutputQueue(name="nn", maxSize=4, blocking=False)
-        
-        # Publisher
-        self.publisher = self.create_publisher(DetectedBalls, 'detected_balls', 10)
-        
-        # Tracked balls
-        self.tracked_balls = {}
-        self.next_ball_id = 0
-        
-        # Timer (30 Hz by default)
-        self.create_timer(1.0 / self.fps, self.timer_callback)
+        if not dets: return []
+        boxes = [[d[0]*width, d[1]*height, (d[2]-d[0])*width, (d[3]-d[1])*height] for d in dets]
+        idx = cv2.dnn.NMSBoxes(boxes, [d[4] for d in dets], CONFIDENCE_THRESHOLD, 0.5)
+        if len(idx) == 0: return []
+        return [(max(0,int(dets[i][0]*width)), max(0,int(dets[i][1]*height)),
+                 min(width,int(dets[i][2]*width)), min(height,int(dets[i][3]*height)),
+                 dets[i][4]) for i in idx.flatten()]
 
-        if self.save_frames:
-            os.makedirs(self.save_path, exist_ok=True)
-        
-        self.get_logger().info('Ball Detection Node initialized')
-    
-    def timer_callback(self):
-        """Poll OAK and publish detections."""
-        try:
-            in_rgb = self.q_rgb.tryGet()
-            in_nn = self.q_nn.tryGet()
-            
-            if in_rgb is None:
-                return
-            
-            frame = in_rgb.getCvFrame()
-            height, width = frame.shape[:2]
-            
+    def device_loop(self):
+        global latest_web_jpeg
+        while self.running and rclpy.ok():
+            in_mjpeg = self.q_mjpeg.get()
+            in_nn = self.q_nn.get()
+
+            W, H = 640, 640
+
             if in_nn is not None:
-                raw_detections = sorted(in_nn.detections, key=lambda x: x.confidence, reverse=True)[:MAX_BALLS]
-                self.tracked_balls, self.next_ball_id = update_tracked_balls(
-                    raw_detections, self.tracked_balls, self.next_ball_id, width, height
-                )
-            
-            # Publish message
+                dets = self.parse_detections(in_nn, W, H)
+                current_frame_matches = {}
+
+                for (rx1, ry1, rx2, ry2, conf) in dets:
+                    rcx, rcy = (rx1 + rx2) // 2, (ry1 + ry2) // 2 
+                    matched_id = None
+                    best_dist = DIST_THRESH
+
+                    for b_id, data_ball in self.tracks.items():
+                        prev_cx = (data_ball.kf.statePost[0,0])
+                        prev_cy = (data_ball.kf.statePost[1,0])
+                        distance = np.hypot(rcx - prev_cx, rcy - prev_cy)
+                        if distance < best_dist:
+                            best_dist = distance
+                            matched_id = b_id
+
+                    if matched_id is None:
+                        matched_id = self.next_id
+                        self.next_id += 1
+                        current_frame_matches[matched_id] = [rx1, ry1, rx2, ry2, 0, conf]
+                    else:
+                        prev = self.tracks[matched_id]
+                        # Extract previous box coords for geometric calculations
+                        p_box = prev.get_box()
+                        sm_x1 = int(ALPHA * rx1 + (1 - ALPHA) * p_box[0])
+                        sm_y1 = int(ALPHA * ry1 + (1 - ALPHA) * p_box[1])
+                        sm_x2 = int(ALPHA * rx2 + (1 - ALPHA) * p_box[2])
+                        sm_y2 = int(ALPHA * ry2 + (1 - ALPHA) * p_box[3]) 
+                        sm_conf = ALPHA * conf + (1 - ALPHA) * prev.conf
+                        current_frame_matches[matched_id] = [sm_x1, sm_y1, sm_x2, sm_y2, 0, sm_conf]
+
+                for b_id in list(self.tracks.keys()):
+                    if b_id not in current_frame_matches:
+                        self.tracks[b_id].age += 1
+                        if self.tracks[b_id].age > 5: del self.tracks[b_id]
+                    else:
+                        m = current_frame_matches[b_id]
+                        self.tracks[b_id].update(m[0], m[1], m[2], m[3], m[5])
+
+                for b_id, data_ball in current_frame_matches.items():
+                    if b_id not in self.tracks:
+                        self.tracks[b_id] = Track(b_id, data_ball[0], data_ball[1], data_ball[2], data_ball[3], data_ball[5])
+
+            # Publish the fast numeric coordinates to driving nodes
             msg = DetectedBalls()
-            msg.header = Header()
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.header.frame_id = 'camera_optical_frame'
-            
-            for b_id, data in self.tracked_balls.items():
-                ball = DetectedBall()
-                ball.id = b_id
-                ball.x1 = float(data[0])
-                ball.y1 = float(data[1])
-                ball.x2 = float(data[2])
-                ball.y2 = float(data[3])
-                ball.confidence = float(data[5])
-                msg.balls.append(ball)
-            
-            self.publisher.publish(msg)
-            
-            # Optional display
-            if self.display_mode:
-                display_detections(frame, self.tracked_balls)
-                cv2.imshow("OAK Detection", frame)
-                cv2.waitKey(1)
-            
-            # Optional: Save frames for debugging
-            if self.save_frames:
-                self.frame_count += 1
-                if self.frame_count % self.save_interval == 0:
-                    display_detections(frame, self.tracked_balls)
-                    filename = os.path.join(self.save_path, f"frame_{self.frame_count:06d}.jpg")
-                    cv2.imwrite(filename, frame)
-                    self.get_logger().info(f"Saved {filename}")
+            for tid, t in self.tracks.items():
+                x1, y1, x2, y2 = t.get_box()
+                b = DetectedBall()
+                b.id, b.x1, b.y1, b.x2, b.y2, b.confidence = tid, float(max(0,x1)), float(max(0,y1)), float(min(W,x2)), float(min(H,y2)), float(t.conf)
+                msg.balls.append(b)
+            self.pub.publish(msg)
 
-            # DEBUG: Delete this later
-            if in_nn is not None:
-                for d in in_nn.detections:
-                    print(f"RAW: xmin={d.xmin:.3f} ymin={d.ymin:.3f} xmax={d.xmax:.3f} ymax={d.ymax:.3f}")
-        
-        except Exception as e:
-            self.get_logger().error(f"Error: {str(e)}")
-    
+            if not SHOW_DISPLAY:
+                # If display is off, wipe the Flask buffer clear and skip frame processing entirely!
+                with frame_lock:
+                    latest_web_jpeg = b''
+                continue
+
+            # Check our global variable toggle
+            jpeg_bytes = in_mjpeg.getData()
+            
+            if self.tracks:
+                img = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+                for tid, t in self.tracks.items():
+                    x1, y1, x2, y2 = t.get_box()
+                    cv2.rectangle(img, (max(0,x1), max(0,y1)), (min(W,x2), min(H,y2)), (0, 255, 0), 2)
+                    cv2.putText(img, f"Ball {tid}: {t.conf*100:.1f}%", (max(0,x1), max(0,y1)-10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                _, encoded_img = cv2.imencode('.jpg', img)
+                jpeg_bytes = encoded_img.tobytes()
+            else:
+                if isinstance(jpeg_bytes, np.ndarray):
+                    jpeg_bytes = jpeg_bytes.tobytes()
+
+            with frame_lock:
+                latest_web_jpeg = jpeg_bytes
+
     def destroy_node(self):
-        """Cleanup on shutdown."""
+        self.running = False
+        self.thread.join()
         self.device.close()
-        if self.display_mode:
-            cv2.destroyAllWindows()
         super().destroy_node()
+
+
+# ===== FLASK WEB ENGINE Worker =====
+
+def generate_web_stream():
+    global latest_web_jpeg
+    while True:
+        with frame_lock:
+            if not latest_web_jpeg:
+                time.sleep(0.01)
+                continue
+            frame_data = latest_web_jpeg
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_data + b'\r\n')
+        time.sleep(0.03)
+
+
+@app.route('/')
+def index():
+    return "<h1>ECE 148 Telemetry Stream</h1><img src='/video_feed' width='640' height='640'>"
+
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_web_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+def run_flask():
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+
 
 def main(args=None):
     rclpy.init(args=args)
+    
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
     node = BallDetectionNode()
+    from rclpy.executors import MultiThreadedExecutor
+    ex = MultiThreadedExecutor(num_threads=2)
+    ex.add_node(node)
     
-    executor = MultiThreadedExecutor(num_threads=2)
-    executor.add_node(node)
-    
-    try:
-        executor.spin()
-    except KeyboardInterrupt:
-        node.get_logger().info("Shutting down...")
-    finally:
+    try: 
+        ex.spin()
+    except KeyboardInterrupt: 
+        pass
+    finally: 
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
