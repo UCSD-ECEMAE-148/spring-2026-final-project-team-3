@@ -8,7 +8,7 @@ from custom_interfaces.msg import DetectedBalls
 class SteeringPIDController:
     """PID controller for steering to center the ball on screen."""
     
-    def __init__(self, kp=0.5, kd=0.1, max_steering=0.4):
+    def __init__(self, kp=0.5, kd=0.1, max_steering=1.0):
         """
         Args:
             kp: Proportional gain
@@ -20,7 +20,7 @@ class SteeringPIDController:
         self.max_steering = max_steering
         
         self.previous_error = 0.0
-        self.dt = 0.1  # 10 Hz timer
+        self.dt = 0.05  # 10 Hz timer
     
     def update(self, error):
         """
@@ -62,7 +62,8 @@ class Driver(Node):
     PIXELS_PER_RADIAN = (IMAGE_CENTER_X) / (FOV_HORIZONTAL_RAD / 2.0)
     
     # Control parameters
-    FORWARD_SPEED = 0.5  # m/s
+    FORWARD_SPEED = 0.35  # m/s
+    
     MIN_CONFIDENCE = 0.5  # Ignore detections below this
     
     def __init__(self):
@@ -80,7 +81,7 @@ class Driver(Node):
         )
         
         # PID controller for steering
-        self.pid_controller = SteeringPIDController(kp=0.5, kd=0.1)
+        self.pid_controller = SteeringPIDController(kp=0.6, kd=0.05)
         
         # State tracking
         self.last_ball_position = None  # (x, y) tuple for ball center
