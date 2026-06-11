@@ -2,7 +2,7 @@ import math
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-from custom_interfaces.msg import DetectedBalls
+from custom_interfaces.msg import DetectedBalls, ControllerInput, LidarRanges
 
 
 class SteeringPIDController:
@@ -63,8 +63,11 @@ class Driver(Node):
     
     # Control parameters
     FORWARD_SPEED = 0.35  # m/s
-    
     MIN_CONFIDENCE = 0.5  # Ignore detections below this
+
+    MANUAL_DRIVE_MODE = True
+
+    TEMP_LIDAR_MODE = True
     
     def __init__(self):
         super().__init__('driver')
@@ -77,6 +80,20 @@ class Driver(Node):
             DetectedBalls,
             '/detected_balls',
             self.ball_callback,
+            10
+        )
+
+        self.controller_subscription = self.create_subscription(
+            ControllerInput,
+            '/controller_input',
+            self.manual_driving,
+            10
+        )
+
+        self.lidar_subscription = self.create_subscription(
+            LidarRanges,
+            '/lidar_ranges',
+            self.lidar_callback,
             10
         )
         
@@ -96,6 +113,28 @@ class Driver(Node):
             f"Driver initialized. FOV: {self.FOV_HORIZONTAL_DEG}° horizontal, "
             f"Image center: ({self.IMAGE_CENTER_X}, 320)"
         )
+
+        self.lidar_vel = {
+            'linear': 0.0, 
+            'angular': 0.0
+        }
+
+        self.MANUAL_SPEED = {
+            'X': 0.0,
+            'Y': 0.0
+        }
+
+    def manual_driving(self, msg):
+        """
+        Callback for manual controller input.
+        
+        Args:
+            msg: ControllerInput message containing button and stick states
+        """
+        if msg.button_y:
+            self.MANUAL_DRIVE_MODE = not self.MANUAL_DRIVE_MODE
+            self.get_logger().info(f"Drive mode toggled: {not self.MANUAL_DRIVE_MODE}")
+        
     
     def ball_callback(self, msg):
         """
@@ -104,6 +143,9 @@ class Driver(Node):
         Args:
             msg: DetectedBalls message containing detected balls
         """
+        if self.TEMP_LIDAR_MODE:
+            return
+        
         if not msg.balls:
             # No balls detected
             self.frames_without_ball += 1
@@ -131,6 +173,33 @@ class Driver(Node):
             f"Ball detected at pixel ({ball_center_x:.1f}, {ball_center_y:.1f}), "
             f"confidence: {primary_ball.confidence:.2f}"
         )
+
+    def lidar_callback(self, msg):
+        """
+        Callback for LidarRanges messages.
+        
+        Args:
+            msg: LidarRanges message containing obstacle information
+        """
+        # for (testing) just ignore the priorities
+        self.get_logger().info(f"Lidar message received with priority: {msg.priority}")
+        action = msg.action
+        if action == "forward":
+            self.lidar_vel['linear'] = self.FORWARD_SPEED
+            self.lidar_vel['angular'] = 0.0
+        elif action == "slight-left":
+            self.lidar_vel['linear'] = self.FORWARD_SPEED
+            self.lidar_vel['angular'] = 0.3
+        elif action == "slight-right":
+            self.lidar_vel['linear'] = self.FORWARD_SPEED
+            self.lidar_vel['angular'] = -0.3
+        elif action == "left":
+            self.lidar_vel['linear'] = 0.0
+            self.lidar_vel['angular'] = 0.5
+        elif action == "right":
+            self.lidar_vel['linear'] = 0.0
+            self.lidar_vel['angular'] = -0.5
+
     
     def pixel_error_to_angle_error(self, pixel_error_x):
         """
@@ -150,34 +219,50 @@ class Driver(Node):
         Main control loop. Called at 10 Hz.
         Calculates steering command based on ball position.
         """
+
         msg = Twist()
-        msg.linear.x = self.FORWARD_SPEED
+
+        if not self.TEMP_LIDAR_MODE:
+            msg.linear.x = self.FORWARD_SPEED
+            
+            if self.last_ball_position is not None and self.frames_without_ball < 3:
+                # Ball detected recently - use steering PID
+                ball_x, ball_y = self.last_ball_position
+                
+                # Calculate lateral error (pixel offset from image center)
+                pixel_error_x = ball_x - self.IMAGE_CENTER_X
+                
+                # Convert to angle error
+                angle_error = self.pixel_error_to_angle_error(pixel_error_x)
+                
+                # Calculate steering command using PID
+                steering_command = self.pid_controller.update(angle_error)
+                
+                msg.angular.z = steering_command
+                
+                self.get_logger().debug(
+                    f"Ball at pixel x={ball_x:.1f}, error={pixel_error_x:.1f}px "
+                    f"({angle_error:.4f}rad), steering={steering_command:.4f}rad"
+                )
+            else:
+                # No ball detected - hold steady
+                msg.angular.z = 0.0
+                if self.frames_without_ball == 0:
+                    self.get_logger().info("No ball detected, steering neutral")
         
-        if self.last_ball_position is not None and self.frames_without_ball < 3:
-            # Ball detected recently - use steering PID
-            ball_x, ball_y = self.last_ball_position
-            
-            # Calculate lateral error (pixel offset from image center)
-            pixel_error_x = ball_x - self.IMAGE_CENTER_X
-            
-            # Convert to angle error
-            angle_error = self.pixel_error_to_angle_error(pixel_error_x)
-            
-            # Calculate steering command using PID
-            steering_command = self.pid_controller.update(angle_error)
-            
-            msg.angular.z = steering_command
-            
-            self.get_logger().debug(
-                f"Ball at pixel x={ball_x:.1f}, error={pixel_error_x:.1f}px "
-                f"({angle_error:.4f}rad), steering={steering_command:.4f}rad"
-            )
         else:
-            # No ball detected - hold steady
-            msg.angular.z = 0.0
-            if self.frames_without_ball == 0:
-                self.get_logger().info("No ball detected, steering neutral")
-        
+            # msg.linear.x = self.lidar_vel['linear']
+            msg.linear.x = self.FORWARD_SPEED
+            msg.angular.z = -self.lidar_vel['angular']
+
+            self.get_logger().info(f'Linear speed: {self.lidar_vel["linear"]:.2f} m/s, Angular speed: {self.lidar_vel["angular"]:.2f} rad/s')
+
+        if self.MANUAL_DRIVE_MODE:
+            msg.linear.x = self.MANUAL_SPEED['X'] / 255.0
+            msg.angular.z = self.MANUAL_SPEED['Y'] / -255.0
+
+            self.get_logger().info(f"Manual drive mode: linear={msg.linear.x:.2f} m/s, angular={msg.angular.z:.2f} rad/s")
+
         self.publisher_.publish(msg)
     
     def destroy_node(self):
