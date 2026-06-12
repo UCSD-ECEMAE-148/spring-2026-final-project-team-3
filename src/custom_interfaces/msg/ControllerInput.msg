@@ -1,0 +1,3 @@
+bool button_y
+float32 left_stick_x
+float32 left_stick_y
