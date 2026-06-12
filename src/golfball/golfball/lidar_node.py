@@ -19,7 +19,7 @@ class LidarNode(Node):
             10
         )
 
-        self.obstacle_threshold = 2.0  # meters
+        self.obstacle_threshold = 1.0  # meters
 
     def scan_callback(self, msg):
         # The SICK TIM 5xx outputs ~811 points for a 270 degree sweep.
@@ -57,7 +57,7 @@ class LidarNode(Node):
         priority = 0
         if detections["Front_Left"] and detections["Front_Right"]:
             priority = 3
-            dir = 'right'
+            dir = 'left' if min_distances["Front_Left"] > min_distances["Front_Right"] else 'right'
             arbitrary_direction = 'left' if min_distances["Front_Left"] > min_distances["Front_Right"] else 'right'
             action = "Selected Turn Arbitrary Direction "+arbitrary_direction        
         elif detections["Front_Left"] and not detections["Front_Right"]:

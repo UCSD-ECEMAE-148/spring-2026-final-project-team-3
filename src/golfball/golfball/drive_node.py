@@ -2,7 +2,8 @@ import math
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-from custom_interfaces.msg import DetectedBalls, ControllerInput, LidarRanges
+from custom_interfaces.msg import DetectedBalls, ControllerInput, LidarRanges, OdomDrive
+from ackermann_msgs.msg import AckermannDriveStamped
 
 
 class SteeringPIDController:
@@ -64,16 +65,34 @@ class Driver(Node):
     # Control parameters
     FORWARD_SPEED = 0.35  # m/s
     MIN_CONFIDENCE = 0.5  # Ignore detections below this
+    LIDAR_PRIORITY = 0
+    ODOM_PRIORITY = 0
 
     MANUAL_DRIVE_MODE = True
 
-    TEMP_LIDAR_MODE = True
+    TEMP_LIDAR_MODE = False
+
+    # odom pid
+    PID_KP = 0.3
+    PID_KD = 0.1
+
+    # normal pid
+    # PID_KP = 0.6
+    # PID_KD = 0.05
     
     def __init__(self):
         super().__init__('driver')
         
         # Publisher for steering commands
-        self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
+        # For vesc without odom
+        # self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
+
+        # For vesc with odom (AckermannDrive)
+        self.publisher_ = self.create_publisher(
+            AckermannDriveStamped, 
+            '/ackermann_cmd', 
+            10
+        )
         
         # Subscriber for ball detection
         self.ball_subscription = self.create_subscription(
@@ -96,14 +115,23 @@ class Driver(Node):
             self.lidar_callback,
             10
         )
+
+        self.odom_drive_subscription = self.create_subscription(
+            OdomDrive,
+            '/odom_drive',
+            self.odom_drive_callback,
+            10
+        )
         
         # PID controller for steering
-        self.pid_controller = SteeringPIDController(kp=0.6, kd=0.05)
+        self.pid_controller = SteeringPIDController(kp=self.PID_KP, kd=self.PID_KD)
         
         # State tracking
         self.last_ball_position = None  # (x, y) tuple for ball center
         self.last_ball_time = None
         self.frames_without_ball = 0
+
+        self.odom_angle = "none"
         
         # Timer for control loop
         timer_period = 0.1  # 10 Hz
@@ -133,7 +161,10 @@ class Driver(Node):
         """
         if msg.button_y:
             self.MANUAL_DRIVE_MODE = not self.MANUAL_DRIVE_MODE
-            self.get_logger().info(f"Drive mode toggled: {not self.MANUAL_DRIVE_MODE}")
+        
+        self.MANUAL_SPEED['X'] = msg.left_stick_x
+        self.MANUAL_SPEED['Y'] = msg.left_stick_y
+        self.get_logger().info(f"Drive mode toggled: {not self.MANUAL_DRIVE_MODE}")
         
     
     def ball_callback(self, msg):
@@ -194,11 +225,24 @@ class Driver(Node):
             self.lidar_vel['linear'] = self.FORWARD_SPEED
             self.lidar_vel['angular'] = -0.3
         elif action == "left":
-            self.lidar_vel['linear'] = 0.0
+            self.lidar_vel['linear'] = self.FORWARD_SPEED
             self.lidar_vel['angular'] = 0.5
         elif action == "right":
-            self.lidar_vel['linear'] = 0.0
+            self.lidar_vel['linear'] = self.FORWARD_SPEED
             self.lidar_vel['angular'] = -0.5
+
+        self.LIDAR_PRIORITY = msg.priority
+
+    def odom_drive_callback(self, msg):
+        """
+        Callback for OdomDrive messages.
+        
+        Args:
+            msg: OdomDrive message containing odometry-based driving commands
+        """
+        self.get_logger().info(f"OdomDrive message received with action: {msg.action}, priority: {msg.priority}")
+        self.ODOM_PRIORITY = msg.priority
+        self.odom_angle = msg.action
 
     
     def pixel_error_to_angle_error(self, pixel_error_x):
@@ -222,7 +266,7 @@ class Driver(Node):
 
         msg = Twist()
 
-        if not self.TEMP_LIDAR_MODE:
+        if not self.TEMP_LIDAR_MODE and self.LIDAR_PRIORITY < 3:
             msg.linear.x = self.FORWARD_SPEED
             
             if self.last_ball_position is not None and self.frames_without_ball < 3:
@@ -244,6 +288,16 @@ class Driver(Node):
                     f"Ball at pixel x={ball_x:.1f}, error={pixel_error_x:.1f}px "
                     f"({angle_error:.4f}rad), steering={steering_command:.4f}rad"
                 )
+            
+            elif self.ODOM_PRIORITY >= 2:
+                # Odom has high priority - override with odom command
+                if self.odom_angle == "left":
+                    msg.angular.z = 0.5
+                elif self.odom_angle == "right":
+                    msg.angular.z = -0.5
+                else:
+                    msg.angular.z = 0.0
+
             else:
                 # No ball detected - hold steady
                 msg.angular.z = 0.0
@@ -263,7 +317,16 @@ class Driver(Node):
 
             self.get_logger().info(f"Manual drive mode: linear={msg.linear.x:.2f} m/s, angular={msg.angular.z:.2f} rad/s")
 
-        self.publisher_.publish(msg)
+        # Vesc without odom
+        # self.publisher_.publish(msg)
+
+        # Vesc with odom (AckermannDrive)
+        ackermann_msg = AckermannDriveStamped()
+        ackermann_msg.header.stamp = self.get_clock().now().to_msg()
+        ackermann_msg.drive.speed = msg.linear.x * 2
+        ackermann_msg.drive.steering_angle = msg.angular.z
+
+        self.publisher_.publish(ackermann_msg)
     
     def destroy_node(self):
         """Cleanup on shutdown."""
