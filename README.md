@@ -4,22 +4,22 @@
 
 ---
 
-## Demo Video
-
-*(Insert demo video link here)*
+![Alt text](./car.jpg)
 
 ---
 
 ## Team Members
 
-* Connor Phon
-* Dominick Cardella
-* Randy Salazar
-* Parth Bhagwat
+| Name | Department |
+|--------------|-----------------|
+| Connor Phon | ECE |
+| Dominick Cardella | ECE |
+| Parth Bhagwat | MAE |
+| Randy Salazar | MAE |
 
 ---
 
-## Project Overview
+## Abstract
 
 This is an autonomous golfball collector. It uses computer vision based golfball detection using an Oak D Lite camera. It uses PID to control steering based on the detection data. It also uses LIDAR for obstacle avoidance. This runs on a Raspberry Pi over SSH and can be used with a Logitech controller.
 
@@ -34,17 +34,66 @@ This is an autonomous golfball collector. It uses computer vision based golfball
 
 ---
 
+### What we Promised
+
+Golfball collection mechanism
+
+Camera-based computer vision
+
+Lidar based obstacle detection
+
+ROS2 integration between perception and actuation
+
+### Stretch Goals
+
+SLAM for mapping out the surrounding area using LIDAR. 
+
+Tilting LIDAR mount to get a 3D topographical view of the area.
+
 ## Hardware
 
 | Component | Details |
 |--------------|-----------------|
-| Platform | Acrylic RC car chassis |
+| Platform | Lasercut Acrylic |
 | Compute | Raspberry Pi |
 | Camera | Oak D Lite |
 | LIDAR | SICK lidar |
 | Controller | Logitech F710 | 
 
 --- 
+
+## Software
+
+Our code is based on the UCSDRobocar Docker environment: 
+ https://github.com/ucsd-ecemae-148/ucsd_robocar_hub2/pkgs/container/ucsd_robocar. 
+
+The custom code we wrote for this project is mainly within the `golfball` package. 
+Within `src/golfball/golfball` we have the following nodes: 
+
+- `ball_detection_node.py` 
+    
+    This starts up the camera and runs the golfball detection model on the Oak D Lite. It uses the DepthAI library to run inference directly on the Oak D Lite rather than the Pi CPU. It publishes the detection data to the `/detected_balls` topic.
+
+- `stream.py`
+
+    This gets the video input and golfball tracking data and displays it on `localhost:5000`. This makes debugging easier.
+
+- `lidar_node.py`
+
+    This reads data from the SICK lidar to find distances to the nearest objects in our surroundings. It publishes suggested steering inputs based on the lidar data. 
+
+- `controller_node.py`
+
+    Pretty much just reads controller inputs and publishes to `/controller_inputs` topic
+
+- `odom_sub_node.py`
+
+    Uses VESC odometry to determine the pose of the car. It can determine the car's distance from its starting location and its angular position. Then it suggests that the car rotates back toward the origin.
+
+- `drive_node.py`
+
+    The node that actually drives the car. It receives data from all the above nodes (except for the stream node) and determines steering and throttle inputs. It handles the servo PID for the golfball collection. Additionally it handles the priorities from the other sensor inputs to figure out where to steer.
+
 
 ## How to Run
 
